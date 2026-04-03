@@ -16,8 +16,15 @@ pub struct Encoder {
     pts: i64,
 }
 
-impl Encoder {
-    pub fn new(width: u32, height: u32) -> Result<Self> {
+pub trait Codec {
+    fn new(width: u32, height: u32) -> Result<Self>
+    where
+        Self: Sized;
+    fn encode(&mut self, frame: &Frame) -> Result<Option<Vec<u8>>>;
+}
+
+impl Codec for Encoder {
+    fn new(width: u32, height: u32) -> Result<Self> {
         ffmpeg::init().context("ffmpeg::init()")?;
 
         let codec = ffmpeg::encoder::find(Id::H264)
@@ -59,7 +66,7 @@ impl Encoder {
 
     /// Retorna NAL units prontos para transmissao/decode.
     /// Pode retornar `Ok(None)` enquanto o encoder buferiza frames iniciais.
-    pub fn encode(&mut self, frame: &Frame) -> Result<Option<Vec<u8>>> {
+    fn encode(&mut self, frame: &Frame) -> Result<Option<Vec<u8>>> {
         let w = frame.width;
         let h = frame.height;
 

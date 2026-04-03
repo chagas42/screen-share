@@ -6,7 +6,7 @@ use codec::Encoder;
 use std::time::Duration;
 use std::thread::sleep;
 use renderer::Renderer;
-
+use codec::Codec;
 
 fn main() -> anyhow::Result<()> {
     let (tx, rx) = channel::<capture::Frame>();
