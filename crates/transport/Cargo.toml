@@ -1,0 +1,12 @@
+[package]
+name = "transport"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+quinn = "0.11"
+rustls = "0.23"

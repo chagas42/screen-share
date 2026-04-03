@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/capture",
+    "crates/codec",
+    "crates/transport",
+    "crates/signaling-server",
+    "crates/session",
+    "crates/input",
+    "crates/renderer",
+    "crates/app",
+]
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "2"
+hmac = "0.12"
+sha2 = "0.10"

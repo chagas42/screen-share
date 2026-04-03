@@ -1,0 +1,11 @@
+[package]
+name = "renderer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+wgpu = "22"
+winit = "0.30"
+capture = { path = "../capture" }
+pollster = "0.3"

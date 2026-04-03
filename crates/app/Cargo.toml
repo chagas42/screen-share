@@ -1,0 +1,18 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "screenshare"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+capture = { path = "../capture" }
+codec = { path = "../codec" }
+transport = { path = "../transport" }
+session = { path = "../session" }
+input = { path = "../input" }
+renderer = { path = "../renderer" }

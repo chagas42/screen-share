@@ -1,0 +1,10 @@
+[package]
+name = "codec"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+ffmpeg-next = "8"
+capture = { path = "../capture" }
+libc = "0.2"
