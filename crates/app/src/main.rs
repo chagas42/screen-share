@@ -1,8 +1,15 @@
 // Fase 1 — pipeline local: capture -> encode -> decode -> render
 // Sem rede. Valida que cada componente funciona corretamente.
+use std::sync::mpsc::channel;
+use codec::Decoder;
+use codec::Encoder;
+use std::time::Duration;
+use std::thread::sleep;
+use renderer::Renderer;
+
 
 fn main() -> anyhow::Result<()> {
-    let (tx, rx) = std::sync::mpsc::channel::<capture::Frame>();
+    let (tx, rx) = channel::<capture::Frame>();
 
     // Thread do pipeline: capture -> encode -> decode -> tx.send()
     std::thread::spawn(move || -> anyhow::Result<()> {
@@ -11,8 +18,8 @@ fn main() -> anyhow::Result<()> {
         let width = first.width;
         let height = first.height;
 
-        let mut encoder = codec::Encoder::new(width, height)?;
-        let mut decoder = codec::Decoder::new()?;
+        let mut encoder = Encoder::new(width, height)?;
+        let mut decoder = Decoder::new()?;
 
         // Envia o primeiro frame diretamente (antes do encode/decode)
         // para que o renderer inicialize o GpuState com as dimensoes corretas
@@ -30,12 +37,12 @@ fn main() -> anyhow::Result<()> {
             }
 
             // ~30fps
-            std::thread::sleep(std::time::Duration::from_millis(33));
+            sleep( Duration::from_millis(33) );
         }
 
         Ok(())
     });
 
     // Renderer na thread principal (requisito do macOS / winit)
-    renderer::Renderer::new(rx).run()
+    Renderer::new(rx).run()
 }
