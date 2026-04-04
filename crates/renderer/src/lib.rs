@@ -46,7 +46,7 @@ struct GpuState {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
-    bgl: wgpu::BindGroupLayout,
+    bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
@@ -96,7 +96,7 @@ impl GpuState {
             .formats
             .iter()
             .copied()
-            .find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb))
+            .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm)
             .unwrap_or(caps.formats[0]);
 
         let config = wgpu::SurfaceConfiguration {
@@ -109,15 +109,16 @@ impl GpuState {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
+
         surface.configure(&device, &config);
 
-        let shader_desc = wgpu::ShaderModuleDescriptor {
+        let shader_module_descriptor = wgpu::ShaderModuleDescriptor {
             label: Some("fullscreen"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         };
-        let shader = device.create_shader_module(shader_desc);
+        let shader = device.create_shader_module(shader_module_descriptor);
 
-        let device_desc_object_configurator= wgpu::BindGroupLayoutDescriptor {
+        let bind_group_layout_descriptor= wgpu::BindGroupLayoutDescriptor {
             label: Some("frame_bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
@@ -139,17 +140,17 @@ impl GpuState {
             ],
         };
 
-        let bgl = device.create_bind_group_layout(&device_desc_object_configurator);
+        let bind_group_layout = device.create_bind_group_layout(&bind_group_layout_descriptor   );
 
-        let layout_desc = wgpu::PipelineLayoutDescriptor {
+        let pipeline_layout_descriptor = wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&bgl],
+            bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         };
 
-        let layout = device.create_pipeline_layout(&layout_desc);
+        let layout = device.create_pipeline_layout(&pipeline_layout_descriptor);
 
-        let render_pipeline_desc = wgpu::RenderPipelineDescriptor {
+        let render_pipeline_descriptor = wgpu::RenderPipelineDescriptor {
             label: Some("fullscreen_pipeline"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
@@ -178,16 +179,18 @@ impl GpuState {
             cache: None,
         };
 
-        let pipeline = device.create_render_pipeline(&render_pipeline_desc);
+        let pipeline = device.create_render_pipeline(&render_pipeline_descriptor);
 
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        let sample_descriptor: wgpu::SamplerDescriptor<'_> = wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
-        });
+        };
+
+        let sampler = device.create_sampler(&sample_descriptor);
 
         let (texture, bind_group) =
-            Self::make_texture_and_bg(&device, &queue, &bgl, &sampler, frame);
+            Self::make_texture_and_bg(&device, &queue, &bind_group_layout, &sampler, frame);
 
         Ok(Self {
             device,
@@ -195,7 +198,7 @@ impl GpuState {
             surface,
             config,
             pipeline,
-            bgl,
+            bind_group_layout,
             sampler,
             texture,
             bind_group,
@@ -256,7 +259,7 @@ impl GpuState {
             let (tex, bg) = Self::make_texture_and_bg(
                 &self.device,
                 &self.queue,
-                &self.bgl,
+                &self.bind_group_layout,
                 &self.sampler,
                 frame,
             );
