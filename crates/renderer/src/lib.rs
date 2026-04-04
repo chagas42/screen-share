@@ -56,29 +56,36 @@ struct GpuState {
 
 impl GpuState {
     fn new(window: Arc<Window>, frame: &Frame) -> Result<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        let desc = wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
-        });
+        };
+        let instance = wgpu::Instance::new(desc);
+
+        // instance.request_adapter(options);
 
         let surface = instance
             .create_surface(window.clone())
             .context("create_surface")?;
 
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        let options = wgpu::RequestAdapterOptions {
             compatible_surface: Some(&surface),
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
-        }))
+        };
+
+        let adapter = pollster::block_on(instance.request_adapter(&options))
         .context("nenhum adapter wgpu compativel")?;
 
+        let desc = &wgpu::DeviceDescriptor {
+            label: None,
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: Default::default(),
+        };
+
         let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: None,
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: Default::default(),
-            },
+            desc,
             None,
         ))
         .context("request_device")?;
@@ -104,12 +111,13 @@ impl GpuState {
         };
         surface.configure(&device, &config);
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader_desc = wgpu::ShaderModuleDescriptor {
             label: Some("fullscreen"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
+        };
+        let shader = device.create_shader_module(shader_desc);
 
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let device_desc_object_configurator= wgpu::BindGroupLayoutDescriptor {
             label: Some("frame_bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
@@ -129,15 +137,19 @@ impl GpuState {
                     count: None,
                 },
             ],
-        });
+        };
 
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let bgl = device.create_bind_group_layout(&device_desc_object_configurator);
+
+        let layout_desc = wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[&bgl],
             push_constant_ranges: &[],
-        });
+        };
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let layout = device.create_pipeline_layout(&layout_desc);
+
+        let render_pipeline_desc = wgpu::RenderPipelineDescriptor {
             label: Some("fullscreen_pipeline"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
@@ -164,7 +176,9 @@ impl GpuState {
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
-        });
+        };
+
+        let pipeline = device.create_render_pipeline(&render_pipeline_desc);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
