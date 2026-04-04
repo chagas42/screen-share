@@ -39,7 +39,7 @@ impl Codec for Encoder {
         ctx.set_height(height);
         ctx.set_format(Pixel::YUV420P);
         ctx.set_time_base(Rational(1, 1000)); // timestamps em ms
-        ctx.set_gop(60); // keyframe a cada 2s a 30fps
+        ctx.set_gop(120); // keyframe a cada 2s a 60fps
         ctx.set_max_b_frames(0); // sem B-frames — latencia minima
 
         let mut opts = Dictionary::new();

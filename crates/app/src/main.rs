@@ -36,8 +36,8 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // ~30fps
-            sleep( Duration::from_millis(33) );
+            // ~60fps
+            sleep(Duration::from_millis(16));
         }
 
         Ok(())
