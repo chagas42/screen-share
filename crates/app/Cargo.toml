@@ -16,3 +16,4 @@ transport = { path = "../transport" }
 session = { path = "../session" }
 input = { path = "../input" }
 renderer = { path = "../renderer" }
+rustls = { version = "0.23", features = ["ring"] }
