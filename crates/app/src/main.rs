@@ -11,17 +11,21 @@ use transport::{Receiver, Sender};
 
 const ADDR: &str = "127.0.0.1:5000";
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
-        .ok(); // ignora se já foi instalado
+        .ok();
 
     let args: Vec<String> = std::env::args().collect();
 
     match args.get(1).map(|s| s.as_str()) {
-        Some("--host")   => host().await,
-        Some("--viewer") => viewer().await,
+        Some("--host") => {
+            tokio::runtime::Runtime::new()?.block_on(host())
+        }
+        Some("--viewer") => {
+            // viewer precisa do renderer na thread principal — tokio vai para background
+            viewer_main()
+        }
         _ => {
             eprintln!("uso: screenshare --host | --viewer");
             Ok(())
@@ -52,17 +56,28 @@ async fn host() -> anyhow::Result<()> {
 
 // ─── Viewer ──────────────────────────────────────────────────────────────────
 
-async fn viewer() -> anyhow::Result<()> {
+fn viewer_main() -> anyhow::Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel::<capture::Frame>();
+
+    // Tokio + QUIC rodam em background
+    std::thread::spawn(move || {
+        tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(async move {
+                if let Err(e) = viewer_recv(tx).await {
+                    eprintln!("[viewer] erro: {e}");
+                }
+            });
+    });
+
+    // Renderer na thread principal — requisito do macOS
+    Renderer::new(rx).run()
+}
+
+async fn viewer_recv(tx: std::sync::mpsc::Sender<capture::Frame>) -> anyhow::Result<()> {
     let addr: SocketAddr = ADDR.parse()?;
     let mut receiver = Receiver::connect(addr).await?;
     let mut decoder = Decoder::new()?;
-
-    let (tx, rx) = std::sync::mpsc::channel::<capture::Frame>();
-
-    // Renderer precisa da thread principal — spawna em background e bloqueia aqui
-    std::thread::spawn(move || {
-        Renderer::new(rx).run().ok();
-    });
 
     loop {
         match receiver.recv().await? {
