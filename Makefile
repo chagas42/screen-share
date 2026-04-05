@@ -6,10 +6,10 @@ TARGET = x86_64-unknown-linux-musl
 # ─── Local ───────────────────────────────────────────────────────────────────
 
 host:
-	export $$(cat .env | xargs) && cargo run -p app -- --host
+	cargo run -p app -- --host
 
 viewer:
-	export $$(cat .env | xargs) && cargo run -p app -- --viewer
+	cargo run -p app -- --viewer
 
 # ─── Deploy ──────────────────────────────────────────────────────────────────
 
