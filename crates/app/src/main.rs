@@ -12,12 +12,15 @@ use renderer::Renderer;
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use transport::{Receiver, Sender};
+use transport::{Receiver, SenderEndpoint};
 
-// URL do signaling server — lida de variavel de ambiente com fallback local
 fn signaling_url() -> String {
     std::env::var("SIGNALING_URL")
         .unwrap_or_else(|_| "ws://localhost:3000".to_string())
+}
+
+fn auth_key() -> Result<String> {
+    std::env::var("AUTH_KEY").context("AUTH_KEY nao definida — defina a variavel de ambiente")
 }
 
 // ─── Mensagens WebSocket (espelho do signaling-server) ────────────────────────
@@ -25,11 +28,12 @@ fn signaling_url() -> String {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Msg {
-    Create { host_addr: String },
+    Auth { key: String },
+    Create { host_addr: String, cert_fingerprint: String },
     Code { code: String },
     ViewerReady { viewer_addr: String },
     Join { code: String, viewer_addr: String },
-    HostReady { host_addr: String },
+    HostReady { host_addr: String, cert_fingerprint: String },
     Error { reason: String },
 }
 
@@ -55,18 +59,31 @@ fn main() -> Result<()> {
 // ─── Host ────────────────────────────────────────────────────────────────────
 
 async fn host() -> Result<()> {
-    // Descobre o IP publico da maquina para passar ao signaling server
+    let key = auth_key()?;
     let local_ip = local_ip()?;
     let quic_addr = format!("{local_ip}:5000");
 
     println!("[host] meu endereco QUIC: {quic_addr}");
 
-    // Conecta ao signaling server e registra a sessao
+    // Bind do QUIC — não bloqueia, só abre a porta e gera o certificado
+    let quic_addr_parsed: SocketAddr = quic_addr.parse()?;
+    let endpoint = SenderEndpoint::bind(quic_addr_parsed)?;
+    let fingerprint = endpoint.fingerprint.clone();
+
+    // Conecta ao signaling com o fingerprint já disponível
     let url = format!("{}/session/create", signaling_url());
     let (mut ws, _) = connect_async(&url).await.context("conectar ao signaling")?;
 
-    let msg = serde_json::to_string(&Msg::Create { host_addr: quic_addr.clone() })?;
+    // Autenticação
+    let msg = serde_json::to_string(&Msg::Auth { key })?;
     ws.send(Message::Text(msg.into())).await?;
+
+    // Anuncia sessão com endereço e fingerprint
+    let create_msg = serde_json::to_string(&Msg::Create {
+        host_addr: quic_addr,
+        cert_fingerprint: fingerprint,
+    })?;
+    ws.send(Message::Text(create_msg.into())).await?;
 
     // Recebe o codigo de sessao
     let code = match ws.next().await {
@@ -83,11 +100,8 @@ async fn host() -> Result<()> {
     println!("[host] codigo de sessao: {code}");
     println!("[host] aguardando viewer...");
 
-    // Abre o servidor QUIC em paralelo enquanto espera o viewer
-    let quic_addr_parsed: SocketAddr = quic_addr.parse()?;
-    let sender_task = tokio::spawn(async move {
-        Sender::bind_and_accept(quic_addr_parsed).await
-    });
+    // Aceita a conexao QUIC em paralelo enquanto espera o viewer no signaling
+    let accept_task = tokio::spawn(async move { endpoint.accept().await });
 
     // Espera o viewer entrar na sessao
     let _viewer_addr = match ws.next().await {
@@ -103,7 +117,7 @@ async fn host() -> Result<()> {
 
     println!("[host] viewer conectou, iniciando stream...");
 
-    let mut sender = sender_task.await??;
+    let mut sender = accept_task.await??;
 
     let first = capture::capture()?;
     let mut encoder = Encoder::new(first.width, first.height)?;
@@ -138,31 +152,35 @@ fn viewer_main() -> Result<()> {
 }
 
 async fn viewer_recv(tx: std::sync::mpsc::Sender<capture::Frame>) -> Result<()> {
-    // Pede o codigo ao usuario
+    let key = auth_key()?;
+
     println!("Digite o codigo de sessao:");
     let mut code = String::new();
     std::io::stdin().read_line(&mut code)?;
     let code = code.trim().to_uppercase();
 
-    // Descobre o proprio IP para passar ao signaling
     let local_ip = local_ip()?;
     let quic_addr = format!("{local_ip}:5001");
 
-    // Conecta ao signaling e entra na sessao
-    let url: String = format!("{}/session/join/{code}", signaling_url());
+    let url = format!("{}/session/join/{code}", signaling_url());
     let (mut ws, _) = connect_async(&url).await.context("conectar ao signaling")?;
 
-    let msg = serde_json::to_string(&Msg::Join {
+    // Autenticação
+    let msg = serde_json::to_string(&Msg::Auth { key })?;
+    ws.send(Message::Text(msg.into())).await?;
+
+    // Entra na sessao
+    let join_msg = serde_json::to_string(&Msg::Join {
         code: code.clone(),
         viewer_addr: quic_addr,
     })?;
-    ws.send(Message::Text(msg.into())).await?;
+    ws.send(Message::Text(join_msg.into())).await?;
 
-    // Recebe o endereco QUIC do host
-    let host_addr: SocketAddr = match ws.next().await {
+    // Recebe endereco e fingerprint do host
+    let (host_addr, cert_fingerprint) = match ws.next().await {
         Some(Ok(Message::Text(txt))) => {
             match serde_json::from_str::<Msg>(&txt)? {
-                Msg::HostReady { host_addr } => host_addr.parse()?,
+                Msg::HostReady { host_addr, cert_fingerprint } => (host_addr, cert_fingerprint),
                 Msg::Error { reason } => anyhow::bail!("signaling erro: {reason}"),
                 other => anyhow::bail!("resposta inesperada: {other:?}"),
             }
@@ -170,9 +188,11 @@ async fn viewer_recv(tx: std::sync::mpsc::Sender<capture::Frame>) -> Result<()> 
         _ => anyhow::bail!("conexao com signaling fechou inesperadamente"),
     };
 
+    let host_addr: SocketAddr = host_addr.parse()?;
     println!("[viewer] conectando ao host em {host_addr}...");
 
-    let mut receiver = Receiver::connect(host_addr).await?;
+    // Conecta verificando o fingerprint — rejeita se não conferir
+    let mut receiver = Receiver::connect(host_addr, cert_fingerprint).await?;
     let mut decoder = Decoder::new()?;
 
     loop {
@@ -193,10 +213,9 @@ async fn viewer_recv(tx: std::sync::mpsc::Sender<capture::Frame>) -> Result<()> 
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// Descobre o IP local da maquina na rede
 fn local_ip() -> Result<String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect("8.8.8.8:80")?; // nao envia nada — so descobre a interface de saida
+    socket.connect("8.8.8.8:80")?;
     let addr = socket.local_addr()?;
     Ok(addr.ip().to_string())
 }

@@ -6,6 +6,7 @@ use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rcgen::generate_simple_self_signed;
 use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 // ─── Packet ──────────────────────────────────────────────────────────────────
 
@@ -19,7 +20,6 @@ pub struct VideoPacket {
 
 // ─── TLS helpers ─────────────────────────────────────────────────────────────
 
-// Gera certificado self-signed em memoria — suficiente para uso local
 fn self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivatePkcs8KeyDer<'static>)> {
     let cert = generate_simple_self_signed(vec!["localhost".into()])
         .context("gerar certificado self-signed")?;
@@ -30,8 +30,15 @@ fn self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivatePkcs8KeyDe
     Ok((vec![cert_der], key_der))
 }
 
-fn server_config() -> Result<ServerConfig> {
+/// Calcula o fingerprint SHA-256 do certificado — usado pelo viewer para verificar o host
+pub fn cert_fingerprint(cert: &CertificateDer) -> String {
+    let hash = Sha256::digest(cert.as_ref());
+    hex::encode(hash)
+}
+
+fn server_config() -> Result<(ServerConfig, String)> {
     let (certs, key) = self_signed_cert()?;
+    let fingerprint = cert_fingerprint(&certs[0]);
 
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -40,17 +47,18 @@ fn server_config() -> Result<ServerConfig> {
 
     tls.alpn_protocols = vec![b"screenshare".to_vec()];
 
-    Ok(ServerConfig::with_crypto(Arc::new(
+    let config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls)
             .context("QuicServerConfig")?,
-    )))
+    ));
+
+    Ok((config, fingerprint))
 }
 
-fn client_config() -> Result<ClientConfig> {
-    // Aceita qualquer certificado — conexao local, sem necessidade de CA real
+fn client_config(expected_fingerprint: String) -> Result<ClientConfig> {
     let mut tls = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipVerify))
+        .with_custom_certificate_verifier(Arc::new(FingerprintVerifier { expected_fingerprint }))
         .with_no_client_auth();
 
     tls.alpn_protocols = vec![b"screenshare".to_vec()];
@@ -61,38 +69,58 @@ fn client_config() -> Result<ClientConfig> {
     )))
 }
 
-// Verifier que aceita qualquer certificado (so para uso local)
+// Verifier que valida o certificado pelo fingerprint recebido via signaling
 #[derive(Debug)]
-struct SkipVerify;
+struct FingerprintVerifier {
+    expected_fingerprint: String,
+}
 
-impl rustls::client::danger::ServerCertVerifier for SkipVerify {
+impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer,
+        end_entity: &CertificateDer,
         _intermediates: &[CertificateDer],
         _server_name: &rustls_pki_types::ServerName,
         _ocsp: &[u8],
         _now: rustls_pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+        let actual = cert_fingerprint(end_entity);
+        if actual == self.expected_fingerprint {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(format!(
+                "fingerprint do certificado nao confere: esperado {}, recebido {}",
+                self.expected_fingerprint, actual
+            )))
+        }
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -104,20 +132,25 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
 
 // ─── Sender (host) ───────────────────────────────────────────────────────────
 
-pub struct Sender {
-    send_stream: quinn::SendStream,
-    seq: u64,
+pub struct SenderEndpoint {
+    endpoint: Endpoint,
+    pub fingerprint: String,
 }
 
-impl Sender {
-    /// Abre servidor QUIC e espera o viewer conectar.
-    pub async fn bind_and_accept(addr: SocketAddr) -> Result<Self> {
-        let endpoint = Endpoint::server(server_config()?, addr)
+impl SenderEndpoint {
+    /// Abre o servidor QUIC e expõe o fingerprint — sem bloquear ainda.
+    pub fn bind(addr: SocketAddr) -> Result<Self> {
+        let (server_cfg, fingerprint) = server_config()?;
+        let endpoint = Endpoint::server(server_cfg, addr)
             .context("Endpoint::server")?;
+        Ok(Self { endpoint, fingerprint })
+    }
 
-        println!("[host] aguardando viewer em {addr}...");
+    /// Espera o viewer conectar e retorna o Sender pronto para enviar.
+    pub async fn accept(self) -> Result<Sender> {
+        println!("[host] aguardando viewer QUIC...");
 
-        let conn = endpoint
+        let conn = self.endpoint
             .accept()
             .await
             .context("nenhuma conexao recebida")?
@@ -131,14 +164,20 @@ impl Sender {
             .await
             .context("open_uni stream de video")?;
 
-        Ok(Self { send_stream, seq: 0 })
+        Ok(Sender { send_stream, seq: 0 })
     }
+}
 
-    /// Envia NAL units como VideoPacket serializado.
+pub struct Sender {
+    send_stream: quinn::SendStream,
+    seq: u64,
+}
+
+impl Sender {
     pub async fn send(&mut self, payload: Vec<u8>, keyframe: bool) -> Result<()> {
         let pkt = VideoPacket {
             seq: self.seq,
-            timestamp: self.seq * 16, // ~60fps em ms
+            timestamp: self.seq * 16,
             keyframe,
             payload,
         };
@@ -147,7 +186,6 @@ impl Sender {
         let bytes = bincode::serde::encode_to_vec(&pkt, bincode::config::standard())
             .context("bincode::encode")?;
 
-        // Prefixo de 4 bytes com o tamanho do pacote — framing simples
         let len = (bytes.len() as u32).to_le_bytes();
         self.send_stream.write_all(&len).await.context("write len")?;
         self.send_stream.write_all(&bytes).await.context("write pkt")?;
@@ -163,12 +201,12 @@ pub struct Receiver {
 }
 
 impl Receiver {
-    /// Conecta ao host e abre o stream de video.
-    pub async fn connect(addr: SocketAddr) -> Result<Self> {
+    /// Conecta ao host verificando o fingerprint do certificado.
+    pub async fn connect(addr: SocketAddr, cert_fingerprint: String) -> Result<Self> {
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)
             .context("Endpoint::client")?;
 
-        endpoint.set_default_client_config(client_config()?);
+        endpoint.set_default_client_config(client_config(cert_fingerprint)?);
 
         println!("[viewer] conectando em {addr}...");
 
@@ -176,7 +214,7 @@ impl Receiver {
             .connect(addr, "localhost")
             .context("connect")?
             .await
-            .context("handshake QUIC")?;
+            .context("handshake QUIC — certificado invalido ou host errado")?;
 
         println!("[viewer] conectado ao host");
 
@@ -188,9 +226,7 @@ impl Receiver {
         Ok(Self { recv_stream })
     }
 
-    /// Recebe o proximo VideoPacket. Retorna None se a conexao encerrou.
     pub async fn recv(&mut self) -> Result<Option<VideoPacket>> {
-        // Le os 4 bytes do tamanho
         let mut len_buf = [0u8; 4];
         match self.recv_stream.read_exact(&mut len_buf).await {
             Ok(()) => {}
@@ -198,7 +234,12 @@ impl Receiver {
             Err(e) => return Err(e).context("read len"),
         }
 
+        const MAX_PACKET_SIZE: usize = 4 * 1024 * 1024; // 4MB
+
         let len = u32::from_le_bytes(len_buf) as usize;
+        if len > MAX_PACKET_SIZE {
+            anyhow::bail!("pacote muito grande: {len} bytes (max {MAX_PACKET_SIZE})");
+        }
         let mut buf = vec![0u8; len];
 
         self.recv_stream

@@ -5,11 +5,12 @@
 //   WS /session/join/:codigo    -- viewer entra na sessao
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
@@ -20,30 +21,37 @@ use tokio::sync::Mutex;
 
 #[derive(Debug)]
 struct Session {
-    host_addr: Option<String>,   // IP:porta QUIC do host
-    viewer_tx: Option<tokio::sync::oneshot::Sender<String>>, // canal para notificar o host
+    host_addr: Option<String>,
+    cert_fingerprint: Option<String>,
+    viewer_tx: Option<tokio::sync::oneshot::Sender<String>>,
     created_at: Instant,
 }
 
-type Sessions = Arc<Mutex<HashMap<String, Session>>>;
+#[derive(Debug)]
+struct RateEntry {
+    attempts: u32,
+    first_attempt: Instant,
+    blocked_until: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    sessions: Arc<Mutex<HashMap<String, Session>>>,
+    rate_limit: Arc<Mutex<HashMap<IpAddr, RateEntry>>>,
+    auth_key: String,
+}
 
 // ─── Mensagens WebSocket ──────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Msg {
-    // host → server: "quero criar sessao, meu endereco QUIC é esse"
-    Create { host_addr: String },
-    // server → host: "seu codigo é X7K2QP"
+    Auth { key: String },
+    Create { host_addr: String, cert_fingerprint: String },
     Code { code: String },
-    // server → host: "viewer conectou, o IP dele é esse"
     ViewerReady { viewer_addr: String },
-
-    // viewer → server: "quero entrar na sessao X7K2QP, meu endereco é esse"
     Join { code: String, viewer_addr: String },
-    // server → viewer: "host encontrado, IP dele é esse"
-    HostReady { host_addr: String },
-
+    HostReady { host_addr: String, cert_fingerprint: String },
     Error { reason: String },
 }
 
@@ -54,23 +62,86 @@ fn gen_code() -> String {
     let mut rng = rand::thread_rng();
     (0..6)
         .map(|_| {
-            let idx = rng.gen_range(0..36);
-            if idx < 10 {
-                (b'0' + idx) as char
-            } else {
-                (b'A' + idx - 10) as char
-            }
+            let idx = rng.gen_range(0..36u8);
+            if idx < 10 { (b'0' + idx) as char } else { (b'A' + idx - 10) as char }
         })
         .collect()
 }
 
+// ─── Rate limiting ────────────────────────────────────────────────────────────
+
+const MAX_ATTEMPTS: u32 = 10;
+const WINDOW_SECS: u64 = 60;
+const BLOCK_SECS: u64 = 300;
+
+async fn check_rate_limit(rate_limit: &Mutex<HashMap<IpAddr, RateEntry>>, ip: IpAddr) -> bool {
+    let mut map = rate_limit.lock().await;
+    let now = Instant::now();
+    let entry = map.entry(ip).or_insert(RateEntry {
+        attempts: 0,
+        first_attempt: now,
+        blocked_until: None,
+    });
+
+    // verifica se ainda está bloqueado
+    if let Some(until) = entry.blocked_until {
+        if now < until {
+            return false;
+        }
+        // bloqueio expirou — reseta
+        entry.attempts = 0;
+        entry.first_attempt = now;
+        entry.blocked_until = None;
+    }
+
+    // reseta janela se expirou
+    if entry.first_attempt.elapsed().as_secs() > WINDOW_SECS {
+        entry.attempts = 0;
+        entry.first_attempt = now;
+    }
+
+    entry.attempts += 1;
+
+    if entry.attempts > MAX_ATTEMPTS {
+        entry.blocked_until = Some(now + Duration::from_secs(BLOCK_SECS));
+        return false;
+    }
+
+    true
+}
+
 // ─── Limpeza de sessoes expiradas ─────────────────────────────────────────────
 
-async fn cleanup_task(sessions: Sessions) {
+async fn cleanup_task(state: AppState) {
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
-        let mut map = sessions.lock().await;
-        map.retain(|_, s| s.created_at.elapsed() < Duration::from_secs(300));
+        state.sessions.lock().await
+            .retain(|_, s| s.created_at.elapsed() < Duration::from_secs(300));
+        state.rate_limit.lock().await
+            .retain(|_, e| e.first_attempt.elapsed().as_secs() < BLOCK_SECS * 2);
+    }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+async fn send(ws: &mut WebSocket, msg: Msg) {
+    if let Ok(txt) = serde_json::to_string(&msg) {
+        let _ = ws.send(Message::Text(txt.into())).await;
+    }
+}
+
+async fn validate_auth(ws: &mut WebSocket, auth_key: &str) -> bool {
+    match ws.recv().await {
+        Some(Ok(Message::Text(txt))) => {
+            match serde_json::from_str::<Msg>(&txt) {
+                Ok(Msg::Auth { key }) if key == auth_key => true,
+                _ => {
+                    send(ws, Msg::Error { reason: "autenticacao invalida".into() }).await;
+                    false
+                }
+            }
+        }
+        _ => false,
     }
 }
 
@@ -78,17 +149,21 @@ async fn cleanup_task(sessions: Sessions) {
 
 async fn handle_create(
     ws: WebSocketUpgrade,
-    State(sessions): State<Sessions>,
+    ConnectInfo(_addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| create_session(socket, sessions))
+    ws.on_upgrade(move |socket| create_session(socket, state))
 }
 
-async fn create_session(mut ws: WebSocket, sessions: Sessions) {
-    // Espera a mensagem Create do host
-    let host_addr = match ws.recv().await {
+async fn create_session(mut ws: WebSocket, state: AppState) {
+    if !validate_auth(&mut ws, &state.auth_key).await {
+        return;
+    }
+
+    let (host_addr, cert_fingerprint) = match ws.recv().await {
         Some(Ok(Message::Text(txt))) => {
             match serde_json::from_str::<Msg>(&txt) {
-                Ok(Msg::Create { host_addr }) => host_addr,
+                Ok(Msg::Create { host_addr, cert_fingerprint }) => (host_addr, cert_fingerprint),
                 _ => {
                     send(&mut ws, Msg::Error { reason: "esperava {type:create}".into() }).await;
                     return;
@@ -100,52 +175,55 @@ async fn create_session(mut ws: WebSocket, sessions: Sessions) {
 
     let code = loop {
         let c = gen_code();
-        let map = sessions.lock().await;
-        if !map.contains_key(&c) {
-            break c;
-        }
+        let map = state.sessions.lock().await;
+        if !map.contains_key(&c) { break c; }
     };
 
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-
     {
-        let mut map = sessions.lock().await;
+        let mut map = state.sessions.lock().await;
         map.insert(code.clone(), Session {
             host_addr: Some(host_addr),
+            cert_fingerprint: Some(cert_fingerprint),
             viewer_tx: Some(tx),
             created_at: Instant::now(),
         });
     }
 
-    // Envia o codigo para o host
     send(&mut ws, Msg::Code { code: code.clone() }).await;
     println!("[signaling] sessao criada: {code}");
 
-    // Espera o viewer entrar (timeout 5 min)
     match tokio::time::timeout(Duration::from_secs(300), rx).await {
         Ok(Ok(viewer_addr)) => {
             send(&mut ws, Msg::ViewerReady { viewer_addr }).await;
             println!("[signaling] sessao {code} estabelecida");
         }
-        _ => {
-            println!("[signaling] sessao {code} expirou");
-        }
+        _ => println!("[signaling] sessao {code} expirou"),
     }
 
-    // Remove sessao
-    sessions.lock().await.remove(&code);
+    state.sessions.lock().await.remove(&code);
 }
 
 async fn handle_join(
     Path(code): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     ws: WebSocketUpgrade,
-    State(sessions): State<Sessions>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| join_session(socket, sessions, code))
+    ws.on_upgrade(move |socket| join_session(socket, state, code, addr.ip()))
 }
 
-async fn join_session(mut ws: WebSocket, sessions: Sessions, code: String) {
-    // Espera a mensagem Join do viewer
+async fn join_session(mut ws: WebSocket, state: AppState, code: String, ip: IpAddr) {
+    if !validate_auth(&mut ws, &state.auth_key).await {
+        return;
+    }
+
+    // rate limiting por IP
+    if !check_rate_limit(&state.rate_limit, ip).await {
+        send(&mut ws, Msg::Error { reason: "muitas tentativas, tente novamente em 5 minutos".into() }).await;
+        return;
+    }
+
     let viewer_addr = match ws.recv().await {
         Some(Ok(Message::Text(txt))) => {
             match serde_json::from_str::<Msg>(&txt) {
@@ -159,16 +237,16 @@ async fn join_session(mut ws: WebSocket, sessions: Sessions, code: String) {
         _ => return,
     };
 
-    // Busca a sessao e notifica o host
-    let host_addr = {
-        let mut map = sessions.lock().await;
+    let (host_addr, cert_fingerprint) = {
+        let mut map = state.sessions.lock().await;
         match map.get_mut(&code) {
             Some(session) => {
                 let host_addr = session.host_addr.clone().unwrap_or_default();
+                let fingerprint = session.cert_fingerprint.clone().unwrap_or_default();
                 if let Some(tx) = session.viewer_tx.take() {
                     let _ = tx.send(viewer_addr);
                 }
-                host_addr
+                (host_addr, fingerprint)
             }
             None => {
                 send(&mut ws, Msg::Error { reason: format!("sessao {code} nao encontrada") }).await;
@@ -177,30 +255,29 @@ async fn join_session(mut ws: WebSocket, sessions: Sessions, code: String) {
         }
     };
 
-    // Envia o endereco do host para o viewer
-    send(&mut ws, Msg::HostReady { host_addr }).await;
-}
-
-// ─── Helper ───────────────────────────────────────────────────────────────────
-
-async fn send(ws: &mut WebSocket, msg: Msg) {
-    if let Ok(txt) = serde_json::to_string(&msg) {
-        let _ = ws.send(Message::Text(txt.into())).await;
-    }
+    send(&mut ws, Msg::HostReady { host_addr, cert_fingerprint }).await;
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+    let auth_key = std::env::var("AUTH_KEY")
+        .expect("AUTH_KEY nao definida — defina a variavel de ambiente antes de iniciar");
 
-    tokio::spawn(cleanup_task(sessions.clone()));
+    let state = AppState {
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        rate_limit: Arc::new(Mutex::new(HashMap::new())),
+        auth_key,
+    };
+
+    tokio::spawn(cleanup_task(state.clone()));
 
     let app = Router::new()
         .route("/session/create", get(handle_create))
         .route("/session/join/:code", get(handle_join))
-        .with_state(sessions);
+        .with_state(state)
+        .into_make_service_with_connect_info::<SocketAddr>();
 
     let addr = "0.0.0.0:3000";
     println!("[signaling] escutando em {addr}");
